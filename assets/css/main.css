@@ -262,7 +262,7 @@ svg { stroke: currentColor; fill: none; stroke-width: 1.75; stroke-linecap: roun
    MAIN WRAP
 ══════════════════════════════════════ */
 .main-wrap {
-  flex: 1; min-width: 0; display: flex; flex-direction: column; overflow: hidden;
+  flex: 1; min-width: 0; display: flex; flex-direction: column; overflow: hidden; position: relative;
   background: var(--bg0);
 }
 
@@ -913,3 +913,40 @@ svg { stroke: currentColor; fill: none; stroke-width: 1.75; stroke-linecap: roun
 .lc-area { opacity: .35; }
 .lc-dot { cursor: pointer; transition: r .15s; }
 .lc-dot:hover { r: 5; }
+
+/* Analytics scroll fix */
+#analyticsContent {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+}
+#analyticsContent::-webkit-scrollbar { width: 4px; }
+#analyticsContent::-webkit-scrollbar-track { background: transparent; }
+#analyticsContent::-webkit-scrollbar-thumb { background: var(--bg5); border-radius: 4px; }
+
+/* Analytics header */
+.analytics-header {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  margin-bottom: 4px;
+}
+.analytics-title {
+  font-size: 18px; font-weight: 800; color: var(--t1); margin: 0 0 4px;
+}
+.analytics-desc {
+  font-size: 11px; color: var(--t4); margin: 0;
+  font-family: 'JetBrains Mono', monospace;
+}
+
+/* Bar chart horizontal */
+.bar-track { transition: opacity .15s; }
+.bar-rect:hover { opacity: 1 !important; filter: brightness(1.15); }
+.bar-pct { fill: var(--t3); font-size: 9px; font-family: 'JetBrains Mono', monospace; }
+
+/* Overview / analytics content areas */
+#overviewContent {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}

@@ -16,10 +16,10 @@ const STATUS_COLORS = { open:'#3fb950', in_progress:'#f0883e', pending:'#a371f7'
 
 /* ═══ STATE ═══ */
 const state = {
-  tickets:[], stats:null, userStats:null,
+  tickets:[], stats:null, agentStats:null, userIdMap:{},
   filterStatus:'', filterCat:'', searchQ:'',
   page:1, selectedId:null,
-  view:'overview', // 'overview' | 'analytics'
+  view:'overview',
   tblSort:{ col:'total', dir:'desc' },
 };
 
@@ -30,9 +30,10 @@ async function init() {
     const res = await fetch('./data/tickets.json');
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const raw = await res.json();
-    state.tickets  = normalise(raw);
-    state.stats    = computeStats(state.tickets);
-    state.userStats = computeUserStats(state.tickets);
+    state.userIdMap  = buildUserIdMap(raw);
+    state.tickets    = normalise(raw);
+    state.stats      = computeStats(state.tickets);
+    state.agentStats = computeAgentStats(raw);
     populateCatSelect();
     updateNavBadges();
     renderDonut();
@@ -54,6 +55,16 @@ function setTopbarDate() {
   if (el) el.textContent = new Date().toLocaleDateString('en-GB',{weekday:'short',day:'numeric',month:'short',year:'numeric'});
 }
 
+/* ═══ BUILD USER ID MAP (id → display_name) ═══ */
+function buildUserIdMap(raw) {
+  const map = {};
+  for (const t of raw) {
+    const u = t.user||{};
+    if (u.id && u.display_name) map[u.id] = u.display_name;
+  }
+  return map;
+}
+
 /* ═══ NORMALISE ═══ */
 function normalise(raw) {
   return raw.map(t => {
@@ -70,6 +81,7 @@ function normalise(raw) {
       closed_raw:  t.closed_at||'',
       replies: t.replies_count||0,
       user:    user.display_name||'',
+      assignedTo: t.assigned_to ? (state.userIdMap[t.assigned_to] || `Agent #${t.assigned_to}`) : '—',
       tags,
       preview: stripHtml(t.latest_reply?.body||''),
       _ym:     (t.created_at||'').slice(0,7),
@@ -80,7 +92,7 @@ function stripHtml(s) {
   return s.replace(/<[^>]*>/g,'').replace(/&nbsp;/g,' ').replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').trim();
 }
 
-/* ═══ COMPUTE STATS ═══ */
+/* ═══ COMPUTE STATS (overview) ═══ */
 function computeStats(tickets) {
   const byStatus={}, byCat={}, byMonth={}, userCount={};
   for (const t of tickets) {
@@ -105,33 +117,41 @@ function computeStats(tickets) {
   };
 }
 
-/* ═══ COMPUTE USER STATS ═══ */
-function computeUserStats(tickets) {
+/* ═══ COMPUTE AGENT STATS (analytics — uses assigned_to) ═══ */
+function computeAgentStats(raw) {
   const map = {};
-  for (const t of tickets) {
-    const u = t.user||'Unknown';
-    if (!map[u]) map[u] = {name:u,total:0,closed:0,open:0,in_progress:0,pending:0,hold:0,replies:0,days:[],cats:{}};
-    const s = t.status;
-    map[u].total++;
-    map[u][s] = (map[u][s]||0)+1;
-    map[u].replies += t.replies;
-    if (s==='closed' && t.created_raw && t.closed_raw) {
+  for (const t of raw) {
+    const aid  = t.assigned_to;
+    if (!aid) continue;
+    const name = state.userIdMap[aid] || `Agent #${aid}`;
+    if (!map[name]) map[name] = {name, agentId:aid, total:0, closed:0, open:0, in_progress:0, pending:0, hold:0, replies:0, days:[], cats:{}, byMonth:{}};
+    const s = (t.status||'open').toLowerCase().replace(/ /g,'_');
+    map[name].total++;
+    map[name][s] = (map[name][s]||0) + 1;
+    map[name].replies += (t.replies_count||0);
+    // resolution time
+    if (s==='closed' && t.created_at && t.closed_at) {
       try {
-        const cr = new Date(t.created_raw), cl = new Date(t.closed_raw);
-        if (!isNaN(cr)&&!isNaN(cl)) map[u].days.push(Math.max(0,(cl-cr)/86400000));
+        const cr=new Date(t.created_at), cl=new Date(t.closed_at);
+        if (!isNaN(cr)&&!isNaN(cl)) map[name].days.push(Math.max(0,(cl-cr)/86400000));
       } catch(e){}
     }
-    for (const cat of t.tags) map[u].cats[cat]=(map[u].cats[cat]||0)+1;
+    // top category
+    for (const tag of (t.tags||[])) {
+      const n=tag.display_name||tag.name||'';
+      if (n) map[name].cats[n]=(map[name].cats[n]||0)+1;
+    }
+    // monthly breakdown
+    const ym=(t.created_at||'').slice(0,7);
+    if (ym) map[name].byMonth[ym]=(map[name].byMonth[ym]||0)+1;
   }
-  // Enrich
-  const arr = Object.values(map).map((u,i)=>({
-    ...u,
-    resolveRate: u.total ? +((u.closed/u.total)*100).toFixed(1) : 0,
-    avgDays:     u.days.length ? +(u.days.reduce((a,b)=>a+b,0)/u.days.length).toFixed(1) : null,
-    topCat:      Object.entries(u.cats).sort((a,b)=>b[1]-a[1])[0]?.[0]||'—',
+  return Object.values(map).map((a,i)=>({
+    ...a,
+    resolveRate: a.total ? +((a.closed/a.total)*100).toFixed(1) : 0,
+    avgDays:     a.days.length ? +(a.days.reduce((x,y)=>x+y,0)/a.days.length).toFixed(1) : null,
+    topCat:      Object.entries(a.cats).sort((x,y)=>y[1]-x[1])[0]?.[0]||'—',
     color:       AVATAR_COLORS[i%AVATAR_COLORS.length],
-  }));
-  return arr.sort((a,b)=>b.total-a.total);
+  })).sort((a,b)=>b.total-a.total);
 }
 
 /* ═══ LOADER ═══ */
@@ -172,7 +192,7 @@ function renderDonut() {
 function getFiltered() {
   const q=state.searchQ.toLowerCase();
   return state.tickets.filter(t=>{
-    if (q&&!t.subject.toLowerCase().includes(q)&&!t.user.toLowerCase().includes(q)&&!String(t.id).includes(q)) return false;
+    if (q&&!t.subject.toLowerCase().includes(q)&&!t.user.toLowerCase().includes(q)&&!t.assignedTo.toLowerCase().includes(q)&&!String(t.id).includes(q)) return false;
     if (state.filterStatus&&t.status!==state.filterStatus) return false;
     if (state.filterCat&&!t.tags.includes(state.filterCat)) return false;
     return true;
@@ -189,8 +209,9 @@ function navClick(el,status) {
 function navAnalytics(el) {
   document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
   el.classList.add('active');
-  state.view='analytics'; state.filterStatus=''; state.page=1;
-  syncChips(); showView('analytics'); renderAnalytics();
+  state.view='analytics';
+  showView('analytics');
+  renderAnalytics();
   if (window.innerWidth<=768) toggleSidebar();
 }
 function bnavClick(el,status) {
@@ -201,13 +222,21 @@ function bnavClick(el,status) {
   syncChips(); showView('overview'); render();
   if (window.innerWidth<=768) { document.getElementById('sidebar')?.classList.remove('open'); document.getElementById('mob-overlay')?.classList.remove('show'); }
 }
+
 function showView(v) {
   const ov=document.getElementById('overviewContent');
   const av=document.getElementById('analyticsContent');
+  const statsGrid=document.getElementById('statsGrid');
+  const chipRow=document.querySelector('.chip-row');
   if (!ov||!av) return;
-  ov.style.display = v==='overview'?'':'none';
-  av.style.display = v==='analytics'?'':'none';
+  const isAnalytics = v==='analytics';
+  ov.style.display     = isAnalytics ? 'none' : '';
+  av.style.display     = isAnalytics ? '' : 'none';
+  // hide stats/chips when analytics is shown (they're overview-specific)
+  if (statsGrid) statsGrid.style.display = isAnalytics ? 'none' : '';
+  if (chipRow)   chipRow.style.display   = isAnalytics ? 'none' : '';
 }
+
 function setFilter(s) { state.filterStatus=s; state.page=1; syncChips(); render(); }
 function setChip(el,s) { state.filterStatus=s; state.page=1; syncChips(); render(); }
 function syncChips() { document.querySelectorAll('.chip').forEach(c=>c.classList.toggle('active',c.dataset.status===state.filterStatus)); }
@@ -216,17 +245,17 @@ function doFilter() {
   state.filterCat=document.getElementById('catSel')?.value||'';
   state.page=1; render();
 }
-function setPage(n) {
+function goPage(p) {
+  if (p<1) return; state.page=p; renderList();
+  document.getElementById('ticketList')?.scrollTo({top:0,behavior:'smooth'});
+}
+function resetToOverview() {
   state.view='overview'; state.filterStatus=''; state.filterCat=''; state.searchQ=''; state.page=1;
   const sq=document.getElementById('searchQ'); if(sq) sq.value='';
   const cs=document.getElementById('catSel'); if(cs) cs.value='';
   syncChips(); showView('overview'); render();
   document.querySelectorAll('.nav-item').forEach((n,i)=>n.classList.toggle('active',i===0));
   document.querySelectorAll('.bnav-item').forEach((n,i)=>n.classList.toggle('active',i===0));
-}
-function goPage(p) {
-  if (p<1) return; state.page=p; renderList();
-  document.getElementById('ticketList')?.scrollTo({top:0,behavior:'smooth'});
 }
 
 /* ═══ HELPERS ═══ */
@@ -293,7 +322,6 @@ function renderList() {
       const urgent=isUrgent(t.subject);
       const subj=urgent?t.subject.replace(/\[urgent\]/i,'').trim():t.subject;
       const clr=statusColor(t.status);
-      const user=t.user.split(/[.\s]/)[0]||t.user;
       return `
         <div class="t-row${t.id===state.selectedId?' selected':''}"
              style="animation-delay:${Math.min(i,12)*.025}s;--bar-clr:${clr}"
@@ -310,7 +338,7 @@ function renderList() {
               ${t.tags.slice(0,2).map(g=>`<span class="cat-tag">${esc(g)}</span>`).join('')}
               <span class="t-meta">
                 <span class="t-replies"><svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg>${t.replies}</span>
-                <span>${esc(user)}</span>·<span>${t.updated||'—'}</span>
+                <span title="Requester">${esc(t.user)}</span>·<span title="Assigned">${esc(t.assignedTo)}</span>·<span>${t.updated||'—'}</span>
               </span>
             </div>
           </div>
@@ -375,179 +403,178 @@ function renderSidebar() {
 }
 
 /* ═══════════════════════════════════════════
-   ANALYTICS VIEW
+   ANALYTICS VIEW  (based on assigned_to = agents)
 ═══════════════════════════════════════════ */
 function renderAnalytics() {
   const el=document.getElementById('analyticsContent');
-  if (!el||!state.userStats) return;
-  const us=state.userStats;
-  const top3=us.slice(0,3);
-  const maxTotal=us[0]?.total||1;
+  if (!el||!state.agentStats) return;
+  const agents=sortAgentStats([...state.agentStats]);
+  const top3=state.agentStats.slice(0,3); // always sort by total for top cards
+  const maxTotal=state.agentStats[0]?.total||1;
   const pcColors=[['#00d4aa','0,212,170'],['#4f94f8','79,148,248'],['#a371f7','163,113,247']];
 
   /* ── Top 3 Performer Cards ── */
-  const perfCards=top3.map((u,i)=>{
+  const perfCards=top3.map((a,i)=>{
     const [clr,rgb]=pcColors[i];
-    const bar=Math.round(u.total/maxTotal*100);
+    const barW=Math.round(a.total/maxTotal*100);
     return `
       <div class="perf-card" style="--pc-clr:${clr};--pc-rgb:${rgb}">
         <div class="perf-rank">#${i+1}</div>
-        <div class="perf-avatar">${initials(u.name)}</div>
-        <div class="perf-name" title="${esc(u.name)}">${esc(u.name)}</div>
-        <div class="perf-meta">Top category: ${esc(u.topCat)}</div>
+        <div class="perf-avatar">${initials(a.name)}</div>
+        <div class="perf-name" title="${esc(a.name)}">${esc(a.name)}</div>
+        <div class="perf-meta">Top: ${esc(a.topCat)}</div>
         <div class="perf-stats">
           <div class="perf-stat">
-            <span class="perf-stat-val" style="color:${clr}">${u.total}</span>
-            <span class="perf-stat-lbl">tickets</span>
+            <span class="perf-stat-val" style="color:${clr}">${a.total}</span>
+            <span class="perf-stat-lbl">assigned</span>
           </div>
           <div class="perf-stat">
-            <span class="perf-stat-val" style="color:${rateColor(u.resolveRate)}">${u.resolveRate}%</span>
+            <span class="perf-stat-val" style="color:${rateColor(a.resolveRate)}">${a.resolveRate}%</span>
             <span class="perf-stat-lbl">resolved</span>
           </div>
           <div class="perf-stat">
-            <span class="perf-stat-val" style="color:var(--amber)">${u.avgDays!=null?u.avgDays+'d':'—'}</span>
+            <span class="perf-stat-val" style="color:var(--amber)">${a.avgDays!=null?a.avgDays+'d':'—'}</span>
             <span class="perf-stat-lbl">avg time</span>
           </div>
         </div>
-        <div class="perf-bar-wrap"><div class="perf-bar-fill" style="width:${bar}%;background:linear-gradient(90deg,${clr},transparent)"></div></div>
+        <div class="perf-bar-wrap"><div class="perf-bar-fill" style="width:${barW}%;background:linear-gradient(90deg,${clr},transparent)"></div></div>
       </div>`;
   }).join('');
 
-  /* ── SVG Bar Chart: tickets per user ── */
-  const top10=us.slice(0,10);
-  const barH=160,barW=480,padL=0,padB=24,barGap=6;
-  const bw=Math.floor((barW-(top10.length-1)*barGap)/top10.length);
-  const maxV=top10[0]?.total||1;
-  const yLines=[0,25,50,75,100].map(pct=>{
-    const y=barH-Math.round(pct/100*barH);
-    const val=Math.round(pct/100*maxV);
-    return `<line class="bar-yline" x1="0" y1="${y}" x2="${barW}" y2="${y}" stroke-dasharray="3 3"/>
-            <text class="bar-label" x="-4" y="${y+3}" text-anchor="end">${val}</text>`;
-  }).join('');
-  const barCols=top10.map((u,i)=>{
-    const bh=Math.max(3,Math.round(u.total/maxV*barH));
-    const x=i*(bw+barGap), y=barH-bh;
+  /* ── SVG Horizontal Bar Chart: tickets per agent ── */
+  const barData=state.agentStats; // use all agents sorted by total
+  const chartW=460, rowH=32, padL=110, padR=60;
+  const maxV=barData[0]?.total||1;
+  const barRows=barData.map((a,i)=>{
+    const bw=Math.max(4, Math.round(a.total/maxV*(chartW-padL-padR)));
+    const y=i*rowH;
     const clr=AVATAR_COLORS[i%AVATAR_COLORS.length];
-    const name=u.name.split(/[.\s]/)[0].slice(0,8);
     return `
-      <g onclick="filterByUser('${u.name.replace(/'/g,"\\'")}')">
-        <rect class="bar-rect" x="${x}" y="${y}" width="${bw}" height="${bh}" rx="3"
-              fill="${clr}" opacity=".75" data-user="${esc(u.name)}" data-val="${u.total}">
-          <title>${esc(u.name)}: ${u.total} tickets (${u.resolveRate}% resolved)</title>
+      <g onclick="filterByAgent('${a.name.replace(/'/g,"\\'")}')" style="cursor:pointer">
+        <text class="bar-label" x="${padL-8}" y="${y+rowH/2+4}" text-anchor="end">${esc(a.name.length>14?a.name.slice(0,13)+'…':a.name)}</text>
+        <rect class="bar-track" x="${padL}" y="${y+6}" width="${chartW-padL-padR}" height="${rowH-12}" rx="4" fill="var(--bg4)" opacity=".5"/>
+        <rect class="bar-rect" x="${padL}" y="${y+6}" width="${bw}" height="${rowH-12}" rx="4" fill="${clr}" opacity=".8">
+          <title>${esc(a.name)}: ${a.total} tickets · ${a.resolveRate}% resolved · avg ${a.avgDays!=null?a.avgDays+'d':'—'}</title>
         </rect>
-        <text class="bar-value" x="${x+bw/2}" y="${y-4}" text-anchor="middle">${u.total}</text>
-        <text class="bar-label" x="${x+bw/2}" y="${barH+14}" text-anchor="middle">${esc(name)}</text>
+        <text class="bar-value" x="${padL+bw+6}" y="${y+rowH/2+4}">${a.total}</text>
+        <text class="bar-pct" x="${chartW-padR+4}" y="${y+rowH/2+4}" style="fill:${rateColor(a.resolveRate)}">${a.resolveRate}%</text>
       </g>`;
   }).join('');
+  const chartH = barData.length * rowH + 8;
 
   /* ── SVG Line Chart: monthly trend ── */
   const months=state.stats.byMonth;
   const lcW=460,lcH=100,lcPad=30;
   const lcMax=Math.max(...months.map(([,,c])=>c),1);
-  const lcPts=months.map(([,, c],i)=>`${Math.round(lcPad+i/(months.length-1||1)*(lcW-lcPad*2))},${Math.round(lcH-4-c/lcMax*(lcH-8))}`);
+  const lcPts=months.map(([,,c],i)=>`${Math.round(lcPad+i/(months.length-1||1)*(lcW-lcPad*2))},${Math.round(lcH-4-c/lcMax*(lcH-12))}`);
   const lcPath=lcPts.join(' ');
-  const lcArea=lcPts.join(' ')+` ${lcPts.at(-1).split(',')[0]},${lcH-2} ${lcPts[0].split(',')[0]},${lcH-2}`;
+  const lcArea=`${lcPts[0].split(',')[0]},${lcH-2} `+lcPts.join(' ')+` ${lcPts.at(-1).split(',')[0]},${lcH-2}`;
   const lcDots=months.map(([lbl,full,c],i)=>{
     const [cx,cy]=lcPts[i].split(',');
-    return `<circle class="lc-dot" cx="${cx}" cy="${cy}" r="3" fill="#00d4aa" stroke="var(--bg2)" stroke-width="2">
+    return `<circle class="lc-dot" cx="${cx}" cy="${cy}" r="3.5" fill="#00d4aa" stroke="var(--bg2)" stroke-width="2">
       <title>${esc(full)}: ${c} tickets</title></circle>
-    <text class="bar-label" x="${cx}" y="${lcH+12}" text-anchor="middle">${lbl}</text>`;
+    <text class="bar-label" x="${cx}" y="${lcH+14}" text-anchor="middle">${lbl}</text>`;
   }).join('');
 
   /* ── Status Breakdown Donut ── */
-  const {byStatus,total}=state.stats;
+  const {byStatus,total,resolveRate}=state.stats;
   const statusSegs=[
-    {label:'Closed',  val:byStatus.closed,      color:'#4f94f8'},
-    {label:'Open',    val:byStatus.open,         color:'#3fb950'},
-    {label:'Progress',val:byStatus.in_progress,  color:'#f0883e'},
-    {label:'Pending', val:byStatus.pending,       color:'#a371f7'},
-    {label:'Hold',    val:byStatus.hold||0,       color:'#f85149'},
+    {label:'Closed',  val:byStatus.closed,      color:'#4f94f8', filter:'closed'},
+    {label:'Open',    val:byStatus.open,         color:'#3fb950', filter:'open'},
+    {label:'Progress',val:byStatus.in_progress,  color:'#f0883e', filter:'in_progress'},
+    {label:'Pending', val:byStatus.pending,       color:'#a371f7', filter:'pending'},
+    {label:'Hold',    val:byStatus.hold||0,       color:'#f85149', filter:'hold'},
   ].filter(s=>s.val>0);
-  const donutTotal=statusSegs.reduce((s,x)=>s+x.val,0);
+  const donutTot=statusSegs.reduce((s,x)=>s+x.val,0);
   const dr=36,dsw=10,dcirc=2*Math.PI*dr;
   let doff=0,dpaths='';
   for (const seg of statusSegs) {
-    const dash=(seg.val/donutTotal)*dcirc;
-    dpaths+=`<circle cx="44" cy="44" r="${dr}" fill="none" stroke="${seg.color}" stroke-width="${dsw}" stroke-dasharray="${dash.toFixed(2)} ${(dcirc-dash).toFixed(2)}" stroke-dashoffset="${(-doff).toFixed(2)}"><title>${seg.label}: ${seg.val}</title></circle>`;
+    const dash=(seg.val/donutTot)*dcirc;
+    dpaths+=`<circle cx="44" cy="44" r="${dr}" fill="none" stroke="${seg.color}" stroke-width="${dsw}" stroke-dasharray="${dash.toFixed(2)} ${(dcirc-dash).toFixed(2)}" stroke-dashoffset="${(-doff).toFixed(2)}" style="cursor:pointer"><title>${seg.label}: ${seg.val}</title></circle>`;
     doff+=dash;
   }
   const legend=statusSegs.map(s=>`
-    <div class="leg-row" onclick="setFilter('${s.label.toLowerCase().replace(' ','_')}');showView('overview');document.querySelectorAll('.nav-item')[0].classList.add('active')">
+    <div class="leg-row" onclick="jumpToFilter('${s.filter}')">
       <span class="leg-dot" style="background:${s.color}"></span>
       <span class="leg-name">${s.label}</span>
       <span class="leg-val">${s.val}</span>
-      <span class="leg-pct">${((s.val/donutTotal)*100).toFixed(1)}%</span>
+      <span class="leg-pct">${((s.val/donutTot)*100).toFixed(1)}%</span>
     </div>`).join('');
 
   /* ── Performance Table ── */
-  const sorted=sortUserStats([...us]);
-  const tableRows=sorted.map((u,i)=>{
-    const clr=AVATAR_COLORS[i%AVATAR_COLORS.length];
-    const rclr=rateColor(u.resolveRate);
-    const catBadge=u.topCat!=='—'?`<span class="tbl-badge" style="background:var(--bg4);color:var(--t3)">${esc(u.topCat.slice(0,12))}</span>`:'';
+  const thSort=(col,label)=>`<th class="sortable${state.tblSort.col===col?' sort-active':''} ${state.tblSort.col===col?(state.tblSort.dir==='asc'?'sort-asc':'sort-desc'):''}" onclick="sortTable('${col}')">${label}</th>`;
+  const tableRows=agents.map((a,i)=>{
+    const clr=AVATAR_COLORS[state.agentStats.indexOf(a)%AVATAR_COLORS.length]||AVATAR_COLORS[0];
+    const rclr=rateColor(a.resolveRate);
     return `
       <tr>
         <td class="tbl-rank">${i+1}</td>
         <td>
           <div class="tbl-user">
-            <div class="tbl-avatar" style="background:${clr}1a;color:${clr}">${initials(u.name)}</div>
-            <span class="tbl-name">${esc(u.name)}</span>
+            <div class="tbl-avatar" style="background:${clr}1a;color:${clr}">${initials(a.name)}</div>
+            <span class="tbl-name">${esc(a.name)}</span>
           </div>
         </td>
-        <td class="tbl-num" style="color:var(--teal)">${u.total}</td>
-        <td class="tbl-num" style="color:var(--green)">${u.closed}</td>
+        <td class="tbl-num" style="color:var(--teal)">${a.total}</td>
+        <td class="tbl-num" style="color:var(--green)">${a.closed}</td>
+        <td class="tbl-num" style="color:var(--amber)">${a.open}</td>
         <td>
           <div class="tbl-rate-wrap">
-            <div class="tbl-rate-bar"><div class="tbl-rate-fill" style="width:${u.resolveRate}%;background:${rclr}"></div></div>
-            <span class="tbl-num" style="color:${rclr};min-width:36px">${u.resolveRate}%</span>
+            <div class="tbl-rate-bar"><div class="tbl-rate-fill" style="width:${a.resolveRate}%;background:${rclr}"></div></div>
+            <span class="tbl-num" style="color:${rclr};min-width:36px">${a.resolveRate}%</span>
           </div>
         </td>
-        <td class="tbl-num" style="color:var(--amber)">${u.avgDays!=null?u.avgDays+'d':'—'}</td>
-        <td class="tbl-num" style="color:var(--t3)">${u.replies}</td>
-        <td>${catBadge}</td>
+        <td class="tbl-num" style="color:var(--amber)">${a.avgDays!=null?a.avgDays+'d':'—'}</td>
+        <td class="tbl-num" style="color:var(--t3)">${a.replies}</td>
+        <td><span class="tbl-badge" style="background:var(--bg4);color:var(--t3)">${esc((a.topCat||'—').slice(0,14))}</span></td>
       </tr>`;
   }).join('');
 
-  const thSort=(col,label)=>`<th class="sortable${state.tblSort.col===col?' sort-active':''} ${state.tblSort.col===col?(state.tblSort.dir==='asc'?'sort-asc':'sort-desc'):''}" onclick="sortTable('${col}')">${label}</th>`;
-
   el.innerHTML=`
     <div class="analytics-view">
+      <!-- Header -->
+      <div class="analytics-header">
+        <div>
+          <h2 class="analytics-title">Agent Performance Analytics</h2>
+          <p class="analytics-desc">Based on ticket assignments · ${state.tickets.length} total tickets · ${state.agentStats.length} active agents</p>
+        </div>
+      </div>
+
       <!-- Top Performers -->
       <div>
         <div class="section-head">
           <span class="section-title">Top Performers</span>
-          <span class="section-sub">${us.length} active requesters</span>
+          <span class="section-sub">by total assignments</span>
         </div>
         <div class="perf-cards">${perfCards}</div>
       </div>
 
       <!-- Charts row -->
       <div class="chart-grid">
-        <!-- Bar chart: tickets per user -->
+        <!-- Horizontal Bar Chart: workload per agent -->
         <div class="chart-card wide">
           <div class="chart-head">
-            <span class="chart-title">Ticket Volume by Requester</span>
-            <span class="chart-sub">Top 10 · click bar to filter</span>
+            <span class="chart-title">Workload per Agent</span>
+            <span class="chart-sub">tickets assigned · resolve % · click to filter</span>
           </div>
           <div class="chart-body" style="overflow-x:auto">
-            <svg class="bar-chart-svg" viewBox="-28 -16 ${barW+32} ${barH+padB+8}" style="min-width:340px;max-width:100%;height:${barH+padB+24}px">
-              ${yLines}
-              ${barCols}
+            <svg class="bar-chart-svg" viewBox="0 0 ${chartW} ${chartH+8}" style="width:100%;height:${chartH+8}px">
+              ${barRows}
             </svg>
           </div>
         </div>
 
-        <!-- Monthly trend line chart -->
+        <!-- Monthly trend -->
         <div class="chart-card">
           <div class="chart-head">
-            <span class="chart-title">Monthly Trend</span>
-            <span class="chart-sub">${months.length} months</span>
+            <span class="chart-title">Monthly Volume Trend</span>
+            <span class="chart-sub">${months.length} months · all agents</span>
           </div>
           <div class="chart-body" style="overflow-x:auto">
-            <svg class="line-chart-svg" viewBox="0 0 ${lcW} ${lcH+18}" style="min-width:260px;height:${lcH+30}px">
+            <svg class="line-chart-svg" viewBox="0 0 ${lcW} ${lcH+20}" style="min-width:240px;height:${lcH+32}px;width:100%">
               <defs>
                 <linearGradient id="lcGrad" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stop-color="#00d4aa" stop-opacity=".4"/>
+                  <stop offset="0%" stop-color="#00d4aa" stop-opacity=".35"/>
                   <stop offset="100%" stop-color="#00d4aa" stop-opacity="0"/>
                 </linearGradient>
               </defs>
@@ -558,7 +585,7 @@ function renderAnalytics() {
           </div>
         </div>
 
-        <!-- Status breakdown donut -->
+        <!-- Status donut -->
         <div class="chart-card">
           <div class="chart-head">
             <span class="chart-title">Status Distribution</span>
@@ -572,7 +599,7 @@ function renderAnalytics() {
                   <circle cx="44" cy="44" r="${dr-dsw/2-2}" fill="var(--bg2)"/>
                 </svg>
                 <div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center">
-                  <div style="font-size:14px;font-weight:700;color:var(--teal);font-family:'JetBrains Mono',monospace">${state.stats.resolveRate}%</div>
+                  <div style="font-size:14px;font-weight:700;color:var(--teal);font-family:'JetBrains Mono',monospace">${resolveRate}%</div>
                   <div style="font-size:8px;color:var(--t4)">resolved</div>
                 </div>
               </div>
@@ -585,8 +612,8 @@ function renderAnalytics() {
       <!-- Performance Table -->
       <div>
         <div class="section-head">
-          <span class="section-title">Performance Overview</span>
-          <span class="section-sub">Click headers to sort</span>
+          <span class="section-title">Full Performance Table</span>
+          <span class="section-sub">Click column headers to sort · click agent name to filter tickets</span>
         </div>
         <div class="chart-card">
           <div class="chart-body" style="padding:0;overflow-x:auto">
@@ -594,11 +621,12 @@ function renderAnalytics() {
               <thead>
                 <tr>
                   <th>#</th>
-                  <th>Requester</th>
-                  ${thSort('total','Tickets')}
+                  <th>Agent</th>
+                  ${thSort('total','Assigned')}
                   ${thSort('closed','Closed')}
-                  ${thSort('resolveRate','Resolve Rate')}
-                  ${thSort('avgDays','Avg Time')}
+                  ${thSort('open','Open')}
+                  ${thSort('resolveRate','Resolve %')}
+                  ${thSort('avgDays','Avg Days')}
                   ${thSort('replies','Replies')}
                   <th>Top Category</th>
                 </tr>
@@ -611,22 +639,24 @@ function renderAnalytics() {
     </div>`;
 }
 
-function sortUserStats(arr) {
+function sortAgentStats(arr) {
   const {col,dir}=state.tblSort;
-  return arr.sort((a,b)=>{
-    const av=a[col]??-1, bv=b[col]??-1;
-    return dir==='asc'?av-bv:bv-av;
-  });
+  return arr.sort((a,b)=>{ const av=a[col]??-1,bv=b[col]??-1; return dir==='asc'?av-bv:bv-av; });
 }
 function sortTable(col) {
   if (state.tblSort.col===col) state.tblSort.dir=state.tblSort.dir==='asc'?'desc':'asc';
   else { state.tblSort.col=col; state.tblSort.dir='desc'; }
   renderAnalytics();
 }
-function filterByUser(name) {
+function filterByAgent(name) {
   state.view='overview'; state.filterStatus=''; state.searchQ=name;
   const sq=document.getElementById('searchQ'); if(sq) sq.value=name;
   showView('overview'); render();
+  document.querySelectorAll('.nav-item').forEach((n,i)=>n.classList.toggle('active',i===0));
+}
+function jumpToFilter(status) {
+  state.view='overview'; state.filterStatus=status; state.page=1;
+  syncChips(); showView('overview'); render();
   document.querySelectorAll('.nav-item').forEach((n,i)=>n.classList.toggle('active',i===0));
 }
 
@@ -647,6 +677,7 @@ function openDetail(id) {
     <div class="drawer-meta-grid">
       <span class="dm-key">ticket_id</span><span class="dm-val mono">#${t.id}</span>
       <span class="dm-key">requester</span><span class="dm-val">${esc(t.user)}</span>
+      <span class="dm-key">assigned_to</span><span class="dm-val" style="color:var(--teal)">${esc(t.assignedTo)}</span>
       <span class="dm-key">created</span><span class="dm-val mono">${t.created||'—'}</span>
       <span class="dm-key">updated</span><span class="dm-val mono">${t.updated||'—'}</span>
       ${t.closed?`<span class="dm-key">resolved</span><span class="dm-val mono">${t.closed}</span>`:''}
